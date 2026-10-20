@@ -1,6 +1,5 @@
-#giving extra information about a variable
-from pydantic import Field
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +12,7 @@ class Settings(BaseSettings):
     )
 
     # OpenAI
-    openai_api_key: str = Field(...)
+    openai_api_key: str | None = Field(default=None)
     openai_embedding_model: str = Field(default="text-embedding-3-small")
     openai_chat_model: str = Field(default="gpt-4o")
 
