@@ -1,6 +1,7 @@
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class Settings(BaseSettings):
@@ -51,12 +52,32 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return (
-            f"postgresql+asyncpg://"
-            f"{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}"
-            f"/{self.db_name}"
-        )
+        """
+        Supports both:
+        1. Local PostgreSQL connections using hostname/IP.
+        2. Google Cloud SQL connections using Unix sockets.
+        """
+
+        if self.db_host.startswith("/"):
+            return URL.create(
+                drivername="postgresql+asyncpg",
+                username=self.db_user,
+                password=self.db_password,
+                database=self.db_name,
+                query={
+                    "host": self.db_host,
+                    "port": str(self.db_port),
+                },
+            ).render_as_string(hide_password=False)
+
+        return URL.create(
+            drivername="postgresql+asyncpg",
+            username=self.db_user,
+            password=self.db_password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
+        ).render_as_string(hide_password=False)
 
     @property
     def is_production(self) -> bool:
@@ -64,3 +85,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+"""Global settings object."""

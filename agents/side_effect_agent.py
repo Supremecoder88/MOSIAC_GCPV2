@@ -2,22 +2,29 @@ import json
 import re
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import (
+    SystemMessage,
+    HumanMessage,
+    ToolMessage,
+)
 
 from graph.state import MosaicState, SignalOutput
 from memory.procedural_store import ProceduralStore
 from memory.episodic_store import EpisodicStore
+
 from tools.search_tools import (
     search_studies_by_meaning,
     search_past_episodes,
-    save_episode,
     get_sponsor_profile,
 )
+
 from tools.clinical_tools import fetch_study_details
+
 from tools.pubmed_tools import (
     fetch_papers_for_trial,
     compare_filing_vs_papers,
 )
+
 from config.settings import settings
 from config.logging_config import setup_logging
 
@@ -26,19 +33,22 @@ logger = setup_logging(__name__)
 
 AGENT_NAME = "side_effect_agent"
 SIGNAL_TYPE = "safety_gap"
+MAX_ITERATIONS = 10
+
 
 AGENT_TOOLS = [
     search_studies_by_meaning,
     search_past_episodes,
-    save_episode,
     get_sponsor_profile,
     fetch_study_details,
     fetch_papers_for_trial,
     compare_filing_vs_papers,
 ]
 
+
 _procedural = ProceduralStore()
 _episodic = EpisodicStore()
+
 
 _llm = ChatOpenAI(
     model=settings.openai_chat_model,
@@ -53,8 +63,12 @@ async def side_effect_node(state: MosaicState) -> dict:
     logger.info(f"{AGENT_NAME} | Starting analysis")
 
     try:
+        # Load procedural rules
         procedures = await _procedural.get_procedures(AGENT_NAME)
-        procedures_text = "\n".join(f"- {rule}" for rule in procedures)
+
+        procedures_text = "\n".join(
+            f"- {rule}" for rule in procedures
+        )
 
         system_prompt = f"""
 You are the Side Effect Checker Agent for MOSAIC.
@@ -69,25 +83,59 @@ REASONING RULES:
 WORKFLOW:
 1. Check past safety investigations.
 2. Search for studies where safety is a concern.
-3. Use compare_filing_vs_papers.
-4. Compare official safety data with published papers.
-5. Flag serious events missing from official filings.
-6. Treat possible safety concerns cautiously.
+3. Retrieve official clinical trial details.
+4. Retrieve publications associated with the trial.
+5. Use compare_filing_vs_papers to compare the evidence.
+6. Identify meaningful differences in reported safety outcomes.
+7. Generate a signal only when an actual discrepancy is supported
+   by comparable evidence from both sources.
+8. If official safety data is unavailable, classify the comparison
+   as insufficient evidence.
 
 LOOK FOR:
-- Filing says no serious adverse events but papers mention hospitalisations.
-- Filing reports mild effects but papers report severe effects.
-- Papers report deaths or discontinuations missing from filings.
-- Papers report results when official results were never posted.
+- Official filing explicitly reports zero serious adverse events,
+  while a publication reports serious adverse events for a
+  comparable population and reporting period.
+- Official filing reports a lower event severity than a publication,
+  with evidence supporting the comparison.
+- Official filing and publication report conflicting safety counts
+  for the same population, treatment arm, and reporting period.
+- Published safety findings that materially contradict explicitly
+  reported official safety findings.
+
+EVIDENCE REQUIREMENTS:
+- Compare information from the same clinical trial.
+- Verify that the publication actually concerns the trial.
+- Distinguish serious adverse events from ordinary adverse events.
+- Verify reporting periods, participant populations, treatment arms,
+  and denominators whenever available.
+- Do not assume that different terminology means contradictory findings.
+- Do not interpret missing registry data as zero adverse events.
+- Do not interpret results_posted=false as evidence of zero events.
+- Do not interpret an absent adverse-event count as a negative finding.
+- A publication reporting adverse events does not automatically
+  establish a discrepancy with the official registry.
+- Require explicit official safety information and publication
+  safety information before generating a discrepancy signal.
+- If official adverse-event counts or relevant safety findings
+  are unavailable, report insufficient evidence.
+- Do not invent adverse events, numbers, dates, or publication findings.
+- If either source is unavailable, report insufficient evidence.
+- Do not generate a signal based only on missing official results.
+- Do not generate a signal without comparable evidence from both sources.
+- Treat screening findings as potential discrepancies, not proven
+  misconduct or confirmed reporting violations.
 
 CONFIDENCE SCORING:
-- 0.9+ : No SAEs in filing, but papers describe hospitalisations/deaths
-- 0.8  : Clear severity difference
-- 0.7  : Additional side effects in papers
-- 0.6  : Minor terminology differences
-- 0.55 : Possible discrepancy requiring human review
+- 0.90+ : Explicit, directly comparable contradiction in both sources.
+- 0.80  : Strong discrepancy with minor differences in reporting scope.
+- 0.70  : Potential discrepancy with some comparable evidence.
+- 0.60  : Limited evidence requiring human review.
+- No signal: Official safety data is missing or insufficient.
 
 OUTPUT FORMAT:
+Return valid JSON objects for detected safety gaps:
+
 {{
     "nct_id": "NCT_ID",
     "signal_type": "safety_gap",
@@ -96,7 +144,10 @@ OUTPUT FORMAT:
     "confidence": 0.80
 }}
 
-If no gaps are found, return NO_SIGNALS_FOUND.
+If no verified gaps are found, return:
+NO_SIGNALS_FOUND
+
+Return the final result only after completing the investigation.
 """
 
         task = state.get(
@@ -121,59 +172,133 @@ Begin the safety comparison.
         ]
 
         signals_found = []
-        max_iterations = 10
+        analysis_completed = False
 
-        for iteration in range(max_iterations):
-            response = await _llm.ainvoke(messages)
+        # LLM tool-calling loop
+        for iteration in range(MAX_ITERATIONS):
 
-            messages.append(
-                AIMessage(content=response.content or "")
+            logger.info(
+                f"{AGENT_NAME} | LLM iteration "
+                f"{iteration + 1}/{MAX_ITERATIONS}"
             )
 
+            response = await _llm.ainvoke(messages)
+
+            # Preserve original tool-call metadata
+            messages.append(response)
+
+            # Final LLM response
             if not response.tool_calls:
-                logger.info(
-                    f"{AGENT_NAME} | Analysis complete | "
-                    f"iteration={iteration + 1}"
-                )
 
                 signals_found = _parse_signals(
                     response.content,
                     AGENT_NAME
                 )
+
+                analysis_completed = True
+
+                logger.info(
+                    f"{AGENT_NAME} | Analysis completed "
+                    f"| iteration={iteration + 1}"
+                )
+
                 break
 
+            # Execute requested tools
             for tool_call in response.tool_calls:
+
+                tool_name = tool_call.get("name", "")
+
+                logger.info(
+                    f"{AGENT_NAME} | Executing tool "
+                    f"| name={tool_name}"
+                )
+
                 result = await _execute_tool(
                     tool_call,
                     AGENT_TOOLS
                 )
 
                 messages.append(
-                    HumanMessage(
-                        content=f"Tool result:\n{result}"
+                    ToolMessage(
+                        content=result,
+                        tool_call_id=tool_call["id"]
                     )
                 )
 
-        await _episodic.save_episode(
-            agent_name=AGENT_NAME,
-            content=(
+        # Do not save incomplete investigations as no_signal
+        if not analysis_completed:
+            raise RuntimeError(
+                f"{AGENT_NAME} reached maximum LLM iterations "
+                "without completing the investigation."
+            )
+
+        # --------------------------------------------------
+        # SAVE INVESTIGATION TO EPISODIC MEMORY
+        # --------------------------------------------------
+
+        # Collect unique NCT IDs from generated signals.
+        signal_nct_ids = list(dict.fromkeys(
+            signal.get("nct_id")
+            for signal in signals_found
+            if signal.get("nct_id")
+        ))
+
+        if signal_nct_ids:
+
+            # Save one episode per identified trial.
+            for nct_id in signal_nct_ids:
+
+                trial_signals = [
+                    signal
+                    for signal in signals_found
+                    if signal.get("nct_id") == nct_id
+                ]
+
+                await _episodic.save_episode(
+                    agent_name=AGENT_NAME,
+                    content=(
+                        f"Task: {task}. "
+                        f"Trial: {nct_id}. "
+                        f"Found {len(trial_signals)} safety gap signals. "
+                        f"Signals: "
+                        f"{[signal.get('summary') for signal in trial_signals]}"
+                    ),
+                    nct_id=nct_id,
+                    outcome="signal_generated",
+                )
+
+        else:
+
+            # Save a general episode if no trial-specific
+            # signal was generated.
+            episode_content = (
                 f"Task: {task}. "
-                f"Found {len(signals_found)} safety gap signals."
-            ),
-            outcome=(
-                "signal_generated"
-                if signals_found
-                else "no_signal"
-            ),
-        )
+                f"Found {len(signals_found)} safety gap signals. "
+                f"Signals: "
+                f"{[signal.get('nct_id') for signal in signals_found]}"
+            )
+
+            await _episodic.save_episode(
+                agent_name=AGENT_NAME,
+                content=episode_content,
+                outcome=(
+                    "signal_generated"
+                    if signals_found
+                    else "no_signal"
+                ),
+            )
 
         logger.info(
-            f"{AGENT_NAME} | Complete | "
-            f"signals_found={len(signals_found)}"
+            f"{AGENT_NAME} | Complete "
+            f"| signals_found={len(signals_found)}"
         )
 
+        # Update graph state
         return {
-            "signals": state.get("signals", []) + signals_found,
+            "signals": (
+                state.get("signals", []) + signals_found
+            ),
             "agents_activated": (
                 state.get("agents_activated", [])
                 + [AGENT_NAME]
@@ -181,7 +306,10 @@ Begin the safety comparison.
         }
 
     except Exception as e:
-        logger.error(f"{AGENT_NAME} | Error | {e}")
+
+        logger.error(
+            f"{AGENT_NAME} | Error | {e}"
+        )
 
         return {
             "error_log": state.get("error_log", []) + [
@@ -198,8 +326,12 @@ def _parse_signals(
     response_text: str,
     agent_name: str
 ) -> list[SignalOutput]:
+    """Extract safety gap signals from LLM output."""
 
-    if not response_text or "NO_SIGNALS_FOUND" in response_text:
+    if not response_text:
+        return []
+
+    if "NO_SIGNALS_FOUND" in response_text:
         return []
 
     pattern = re.compile(
@@ -210,25 +342,44 @@ def _parse_signals(
     signals = []
 
     for match in pattern.findall(response_text):
+
         try:
             data = json.loads(match)
 
-            signals.append({
+            # Accept only this agent's signal type
+            if data.get("signal_type") != SIGNAL_TYPE:
+                continue
+
+            evidence = data.get("evidence", [])
+
+            if not isinstance(evidence, list):
+                continue
+
+            confidence = float(
+                data.get("confidence", 0.5)
+            )
+
+            confidence = max(
+                0.0,
+                min(1.0, confidence)
+            )
+
+            signal: SignalOutput = {
                 "agent": agent_name,
-                "signal_type": data.get(
-                    "signal_type",
-                    SIGNAL_TYPE
-                ),
+                "signal_type": SIGNAL_TYPE,
                 "nct_id": data.get("nct_id", ""),
                 "summary": data.get("summary", ""),
-                "evidence": data.get("evidence", []),
-                "confidence": float(
-                    data.get("confidence", 0.5)
-                ),
-            })
+                "evidence": evidence,
+                "confidence": confidence,
+            }
 
-        except (json.JSONDecodeError, ValueError):
-            continue
+            signals.append(signal)
+
+        except (json.JSONDecodeError, ValueError) as e:
+
+            logger.warning(
+                f"Could not parse safety gap JSON: {e}"
+            )
 
     return signals
 
@@ -237,6 +388,7 @@ async def _execute_tool(
     tool_call: dict,
     available_tools: list
 ) -> str:
+    """Execute an asynchronous LangChain tool."""
 
     tool_name = tool_call.get("name", "")
     tool_args = tool_call.get("args", {})
@@ -247,14 +399,37 @@ async def _execute_tool(
             for tool in available_tools
             if tool.name == tool_name
         ),
-        None,
+        None
     )
 
     if tool_func is None:
+
+        logger.error(
+            f"Tool not found | name={tool_name}"
+        )
+
         return f"Error: Tool '{tool_name}' not found."
 
     try:
-        return str(tool_func.invoke(tool_args))
+
+        result = await tool_func.ainvoke(tool_args)
+
+        if isinstance(result, str):
+            return result
+
+        return json.dumps(
+            result,
+            default=str
+        )
 
     except Exception as e:
-        return f"Error executing '{tool_name}': {e}"
+
+        logger.error(
+            f"Tool execution failed "
+            f"| tool={tool_name} | error={e}"
+        )
+
+        return json.dumps({
+            "error": str(e),
+            "tool": tool_name,
+        })

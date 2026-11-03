@@ -1,6 +1,4 @@
-# tools/pubmed_tools.py
 
-import asyncio
 import json
 
 from langchain_core.tools import tool
@@ -14,32 +12,24 @@ logger = setup_logging(__name__)
 _parser = DocumentParser()
 
 
-def _run_async(coroutine):
-    """Run an async operation synchronously."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coroutine)
-
-
 @tool
-def fetch_papers_for_trial(
+async def fetch_papers_for_trial(
     nct_id: str,
     max_papers: int = 10,
 ) -> str:
     """Fetch published papers referencing a clinical trial."""
+
     logger.info(
         f"Tool called: fetch_papers_for_trial | "
         f"nct_id={nct_id} | max_papers={max_papers}"
     )
 
-    async def _fetch():
+    try:
         async with PubMedClient() as client:
-            return await client.fetch_papers_for_trial(
+            raw_papers = await client.fetch_papers_for_trial(
                 nct_id=nct_id,
                 max_results=max_papers,
             )
-
-    try:
-        raw_papers = _run_async(_fetch())
 
         if not raw_papers:
             return json.dumps({
@@ -52,11 +42,15 @@ def fetch_papers_for_trial(
                 ),
             }, indent=2)
 
-        parsed_papers = _parser.parse_papers(raw_papers=raw_papers)
+        parsed_papers = _parser.parse_papers(
+            raw_papers=raw_papers
+        )
+
         papers_list = []
 
         for paper in parsed_papers:
             paper_dict = paper.model_dump()
+
             papers_list.append({
                 "pmid": paper_dict["pmid"],
                 "title": paper_dict["title"],
@@ -79,6 +73,7 @@ def fetch_papers_for_trial(
             f"fetch_papers_for_trial failed | "
             f"nct_id={nct_id} | error={e}"
         )
+
         return json.dumps({
             "nct_id": nct_id,
             "error": str(e),
@@ -88,32 +83,23 @@ def fetch_papers_for_trial(
 
 
 @tool
-def search_pubmed_by_query(
+async def search_pubmed_by_query(
     query: str,
     max_papers: int = 5,
 ) -> str:
     """Search PubMed for papers matching a topic or query."""
+
     logger.info(
         f"Tool called: search_pubmed_by_query | "
         f"query='{query[:60]}' | max_papers={max_papers}"
     )
 
-    async def _search():
+    try:
         async with PubMedClient() as client:
-            paper_ids = await client._search_paper_ids(
-                nct_id=query,
+            raw_papers = await client.search_papers_by_query(
+                query=query,
                 max_results=max_papers,
             )
-
-            if not paper_ids:
-                return []
-
-            return await client._fetch_paper_details(
-                paper_ids=paper_ids
-            )
-
-    try:
-        raw_papers = _run_async(_search())
 
         if not raw_papers:
             return json.dumps({
@@ -126,11 +112,15 @@ def search_pubmed_by_query(
                 ),
             }, indent=2)
 
-        parsed_papers = _parser.parse_papers(raw_papers=raw_papers)
+        parsed_papers = _parser.parse_papers(
+            raw_papers=raw_papers
+        )
+
         papers_list = []
 
         for paper in parsed_papers:
             paper_dict = paper.model_dump()
+
             papers_list.append({
                 "pmid": paper_dict["pmid"],
                 "title": paper_dict["title"],
@@ -153,6 +143,7 @@ def search_pubmed_by_query(
             f"search_pubmed_by_query failed | "
             f"query={query} | error={e}"
         )
+
         return json.dumps({
             "query": query,
             "error": str(e),
@@ -162,24 +153,28 @@ def search_pubmed_by_query(
 
 
 @tool
-def compare_filing_vs_papers(
+async def compare_filing_vs_papers(
     nct_id: str,
     filing_summary: str,
 ) -> str:
-    """Compare a trial's official filing with published papers."""
+    """
+    Compare published papers with trial filing context.
+
+    The filing_summary is agent-provided context, not independently
+    verified official registry safety data.
+    """
+
     logger.info(
         f"Tool called: compare_filing_vs_papers | nct_id={nct_id}"
     )
 
-    async def _fetch():
+    try:
         async with PubMedClient() as client:
-            return await client.fetch_papers_for_trial(
+            raw_papers = await client.fetch_papers_for_trial(
                 nct_id=nct_id,
                 max_results=15,
             )
 
-    try:
-        raw_papers = _run_async(_fetch())
         parsed_papers = _parser.parse_papers(
             raw_papers=raw_papers or []
         )
@@ -188,6 +183,7 @@ def compare_filing_vs_papers(
 
         for paper in parsed_papers:
             paper_dict = paper.model_dump()
+
             papers_list.append({
                 "pmid": paper_dict["pmid"],
                 "title": paper_dict["title"],
@@ -197,20 +193,43 @@ def compare_filing_vs_papers(
                 "authors": paper_dict["authors"][:3],
             })
 
-        comparison_note = (
-            "Compare the filing_summary against each paper's abstract. "
-            "Check for adverse events absent from the filing, differences "
-            "in event severity, contradictory outcome results, and "
-            "published results when results_posted=False."
-        )
-
         return json.dumps({
             "nct_id": nct_id,
+
+            # Agent-provided context; not verified registry evidence.
             "filing_summary": filing_summary,
+            "filing_summary_verified": False,
+
+            # Retrieved publication evidence.
             "papers": papers_list,
             "papers_count": len(papers_list),
-            "comparison_note": comparison_note,
             "has_papers": len(papers_list) > 0,
+
+            # Conservative safety validation.
+            "official_safety_data_verified": False,
+            "official_adverse_event_counts_available": False,
+            "safety_comparison_status": "INSUFFICIENT_OFFICIAL_DATA",
+            "safety_gap_signal_allowed": False,
+
+            "validation_rules": [
+                "The filing_summary is agent-provided context, not verified registry evidence.",
+                "Missing adverse-event counts must be treated as unknown, never as zero.",
+                "results_posted=false does not establish that zero adverse events occurred.",
+                "Published adverse events alone do not establish an official reporting discrepancy.",
+                "A safety reporting gap must not be generated without verified official "
+                "adverse-event counts and comparable publication evidence.",
+                "Compare matching populations, treatment arms, reporting periods, "
+                "event definitions, severity, and denominators.",
+            ],
+
+            "comparison_note": (
+                "Published papers were retrieved, but official adverse-event "
+                "counts have not been independently verified by this tool. "
+                "Therefore, this result cannot establish a discrepancy in "
+                "safety reporting. Treat the safety comparison as insufficient "
+                "evidence and do not generate a safety-gap signal."
+            ),
+
         }, indent=2, default=str)
 
     except Exception as e:
@@ -218,10 +237,14 @@ def compare_filing_vs_papers(
             f"compare_filing_vs_papers failed | "
             f"nct_id={nct_id} | error={e}"
         )
+
         return json.dumps({
             "nct_id": nct_id,
             "error": str(e),
             "papers": [],
+            "official_safety_data_verified": False,
+            "safety_comparison_status": "INSUFFICIENT_OFFICIAL_DATA",
+            "safety_gap_signal_allowed": False,
         })
 
 

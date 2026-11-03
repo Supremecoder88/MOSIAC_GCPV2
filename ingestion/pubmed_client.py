@@ -74,6 +74,37 @@ class PubMedClient:
 
         return papers
 
+    
+    async def search_papers_by_query(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search PubMed for papers matching a general topic or query."""
+
+        logger.info(f"Searching PubMed by topic | query={query}")
+
+        paper_ids = await self._search_paper_ids_by_query(
+            query=query,
+            max_results=max_results,
+        )
+
+        if not paper_ids:
+            logger.info(f"No papers found | query={query}")
+            return []
+
+        papers = await self._fetch_paper_details(
+            paper_ids=paper_ids
+        )
+
+        logger.info(
+            f"PubMed topic search complete | "
+            f"query={query} | papers_returned={len(papers)}"
+        )
+
+        return papers
+
+
     async def fetch_papers_for_trials(
         self,
         nct_ids: list[str],
@@ -169,6 +200,76 @@ class PubMedClient:
                 f"nct_id={nct_id} | error={e}"
             )
             return []
+
+    
+    @retry(
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_exponential(
+            multiplier=1,
+            min=1,
+            max=8,
+        ),
+        retry=retry_if_exception_type(
+            (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+            )
+        ),
+    )
+    async def _search_paper_ids_by_query(
+        self,
+        query: str,
+        max_results: int,
+    ) -> list[str]:
+        """Search PubMed using a general query instead of an NCT ID."""
+
+        try:
+            response = await self._client.get(
+                f"{BASE_URL}/esearch.fcgi",
+                params={
+                    "db": "pubmed",
+                    "term": query,
+                    "retmax": max_results,
+                    "retmode": "json",
+                    "usehistory": "n",
+                },
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            id_list = data.get(
+                "esearchresult", {}
+            ).get(
+                "idlist", []
+            )
+
+            await asyncio.sleep(RATE_LIMIT_SLEEP)
+
+            return id_list
+
+        except httpx.TimeoutException:
+            logger.warning(
+                f"Timeout searching PubMed by topic | "
+                f"query={query} — retrying..."
+            )
+            raise
+
+        except httpx.ConnectError:
+            logger.warning(
+                f"Connection error searching PubMed by topic | "
+                f"query={query} — retrying..."
+            )
+            raise
+
+        except Exception as e:
+            logger.error(
+                f"Failed to search PubMed by topic | "
+                f"query={query} | error={e}"
+            )
+            return []
+
 
     async def _fetch_paper_details(
         self,

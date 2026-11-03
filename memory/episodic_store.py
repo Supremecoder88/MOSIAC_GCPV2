@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 import asyncpg
 from openai import AsyncOpenAI
@@ -87,7 +87,7 @@ class EpisodicStore:
                 content,
                 outcome,
                 embedding,
-                datetime.utcnow(),
+                datetime.now(timezone.utc),
             )
 
         logger.info(

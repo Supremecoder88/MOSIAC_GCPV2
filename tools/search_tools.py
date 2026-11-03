@@ -1,9 +1,10 @@
-import asyncio
+
 import json
 
 from langchain_core.tools import tool
 
 from processing.vector_store import VectorStore
+from processing.embedder import Embedder
 from memory.episodic_store import EpisodicStore
 from memory.semantic_store import SemanticStore
 from config.logging_config import setup_logging
@@ -11,37 +12,33 @@ from config.logging_config import setup_logging
 
 logger = setup_logging(__name__)
 
-# Shared store instances
+# Shared store and embedding instances
 _vector_store = VectorStore()
+_embedder = Embedder()
 _episodic_store = EpisodicStore()
 _semantic_store = SemanticStore()
 
 
-def _run_async(coroutine):
-    """Run an async database operation synchronously."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coroutine)
-
-
 @tool
-def search_studies_by_meaning(
+async def search_studies_by_meaning(
     query: str,
     top_k: int = 5,
     source_filter: str = "study",
 ) -> str:
     """Search clinical trial studies by semantic similarity."""
+
     logger.info(
         f"Tool called: search_studies_by_meaning | "
         f"query='{query[:60]}' | top_k={top_k}"
     )
 
     try:
-        results = _run_async(
-            _vector_store.search(
-                query_text=query,
-                top_k=top_k,
-                source_filter=source_filter,
-            )
+        query_embedding = await _embedder.embed_query(query)
+
+        results = await _vector_store.search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            source_filter=source_filter,
         )
 
         if not results:
@@ -61,28 +58,30 @@ def search_studies_by_meaning(
         logger.error(
             f"search_studies_by_meaning failed | error={e}"
         )
-        return json.dumps({"error": str(e), "results": []})
+        return json.dumps({
+            "error": str(e),
+            "results": [],
+        })
 
 
 @tool
-def search_past_episodes(
+async def search_past_episodes(
     query: str,
     agent_name: str,
     top_k: int = 3,
 ) -> str:
     """Search past agent sessions for relevant findings."""
+
     logger.info(
         f"Tool called: search_past_episodes | "
         f"agent={agent_name} | query='{query[:60]}'"
     )
 
     try:
-        episodes = _run_async(
-            _episodic_store.search_episodes(
-                query=query,
-                agent_name=agent_name,
-                top_k=top_k,
-            )
+        episodes = await _episodic_store.search_episodes(
+            query=query,
+            agent_name=agent_name,
+            top_k=top_k,
         )
 
         if not episodes:
@@ -102,31 +101,35 @@ def search_past_episodes(
         }, indent=2, default=str)
 
     except Exception as e:
-        logger.error(f"search_past_episodes failed | error={e}")
-        return json.dumps({"error": str(e), "episodes": []})
+        logger.error(
+            f"search_past_episodes failed | error={e}"
+        )
+        return json.dumps({
+            "error": str(e),
+            "episodes": [],
+        })
 
 
 @tool
-def save_episode(
+async def save_episode(
     agent_name: str,
     content: str,
     nct_id: str = "",
     outcome: str = "completed",
 ) -> str:
     """Save an agent's investigation to episodic memory."""
+
     logger.info(
         f"Tool called: save_episode | "
         f"agent={agent_name} | nct_id={nct_id} | outcome={outcome}"
     )
 
     try:
-        episode_id = _run_async(
-            _episodic_store.save_episode(
-                agent_name=agent_name,
-                content=content,
-                nct_id=nct_id if nct_id else None,
-                outcome=outcome,
-            )
+        episode_id = await _episodic_store.save_episode(
+            agent_name=agent_name,
+            content=content,
+            nct_id=nct_id if nct_id else None,
+            outcome=outcome,
         )
 
         return json.dumps({
@@ -137,20 +140,28 @@ def save_episode(
         }, indent=2)
 
     except Exception as e:
-        logger.error(f"save_episode failed | error={e}")
-        return json.dumps({"success": False, "error": str(e)})
+        logger.error(
+            f"save_episode failed | error={e}"
+        )
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        })
 
 
 @tool
-def get_sponsor_profile(sponsor_name: str) -> str:
+async def get_sponsor_profile(
+    sponsor_name: str,
+) -> str:
     """Retrieve historical information about a research sponsor."""
+
     logger.info(
         f"Tool called: get_sponsor_profile | sponsor={sponsor_name}"
     )
 
     try:
-        profile = _run_async(
-            _semantic_store.get_sponsor_profile(sponsor=sponsor_name)
+        profile = await _semantic_store.get_sponsor_profile(
+            sponsor=sponsor_name
         )
 
         if profile is None:
@@ -170,18 +181,24 @@ def get_sponsor_profile(sponsor_name: str) -> str:
         }, indent=2, default=str)
 
     except Exception as e:
-        logger.error(f"get_sponsor_profile failed | error={e}")
-        return json.dumps({"error": str(e), "found": False})
+        logger.error(
+            f"get_sponsor_profile failed | error={e}"
+        )
+        return json.dumps({
+            "error": str(e),
+            "found": False,
+        })
 
 
 @tool
-def update_sponsor_profile(
+async def update_sponsor_profile(
     sponsor_name: str,
     results_posted: bool = False,
     had_broken_promise: bool = False,
     delay_days: int = 0,
 ) -> str:
     """Update a sponsor's profile with findings from a study."""
+
     logger.info(
         f"Tool called: update_sponsor_profile | "
         f"sponsor={sponsor_name} | "
@@ -191,13 +208,11 @@ def update_sponsor_profile(
     )
 
     try:
-        _run_async(
-            _semantic_store.update_sponsor_knowledge(
-                sponsor=sponsor_name,
-                results_posted=results_posted,
-                had_broken_promise=had_broken_promise,
-                delay_days=delay_days,
-            )
+        await _semantic_store.update_sponsor_knowledge(
+            sponsor=sponsor_name,
+            results_posted=results_posted,
+            had_broken_promise=had_broken_promise,
+            delay_days=delay_days,
         )
 
         return json.dumps({
@@ -210,27 +225,31 @@ def update_sponsor_profile(
         }, indent=2)
 
     except Exception as e:
-        logger.error(f"update_sponsor_profile failed | error={e}")
-        return json.dumps({"success": False, "error": str(e)})
+        logger.error(
+            f"update_sponsor_profile failed | error={e}"
+        )
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+        })
 
 
 @tool
-def get_low_credibility_sponsors(
+async def get_low_credibility_sponsors(
     threshold: float = 0.6,
     min_studies: int = 3,
 ) -> str:
     """Find sponsors whose credibility scores are below a threshold."""
+
     logger.info(
         f"Tool called: get_low_credibility_sponsors | "
         f"threshold={threshold} | min_studies={min_studies}"
     )
 
     try:
-        sponsors = _run_async(
-            _semantic_store.get_low_credibility_sponsors(
-                threshold=threshold,
-                min_studies=min_studies,
-            )
+        sponsors = await _semantic_store.get_low_credibility_sponsors(
+            threshold=threshold,
+            min_studies=min_studies,
         )
 
         if not sponsors:
@@ -253,15 +272,19 @@ def get_low_credibility_sponsors(
         logger.error(
             f"get_low_credibility_sponsors failed | error={e}"
         )
-        return json.dumps({"error": str(e), "sponsors": []})
+        return json.dumps({
+            "error": str(e),
+            "sponsors": [],
+        })
 
 
 @tool
-def search_study_chunks_by_nct_id(
+async def search_study_chunks_by_nct_id(
     nct_id: str,
     query: str = "",
 ) -> str:
     """Retrieve chunks for a specific clinical trial."""
+
     logger.info(
         f"Tool called: search_study_chunks_by_nct_id | "
         f"nct_id={nct_id}"
@@ -269,18 +292,16 @@ def search_study_chunks_by_nct_id(
 
     try:
         if query:
-            # Search relevant chunks within this study.
-            results = _run_async(
-                _vector_store.search(
-                    query_text=query,
-                    top_k=5,
-                    nct_id_filter=nct_id,
-                )
+            query_embedding = await _embedder.embed_query(query)
+
+            results = await _vector_store.search(
+                query_embedding=query_embedding,
+                top_k=5,
+                nct_id_filter=nct_id,
             )
         else:
-            # Retrieve every chunk for the study.
-            results = _run_async(
-                _vector_store.get_chunks_for_study(nct_id=nct_id)
+            results = await _vector_store.get_chunks_for_study(
+                nct_id=nct_id
             )
 
         if not results:
@@ -304,27 +325,31 @@ def search_study_chunks_by_nct_id(
             f"search_study_chunks_by_nct_id failed | "
             f"nct_id={nct_id} | error={e}"
         )
-        return json.dumps({"error": str(e), "chunks": []})
+        return json.dumps({
+            "error": str(e),
+            "chunks": [],
+        })
 
 
 @tool
-def search_papers_by_meaning(
+async def search_papers_by_meaning(
     query: str,
     top_k: int = 5,
 ) -> str:
     """Search published PubMed papers by semantic similarity."""
+
     logger.info(
         f"Tool called: search_papers_by_meaning | "
         f"query='{query[:60]}' | top_k={top_k}"
     )
 
     try:
-        results = _run_async(
-            _vector_store.search(
-                query_text=query,
-                top_k=top_k,
-                source_filter="paper",
-            )
+        query_embedding = await _embedder.embed_query(query)
+
+        results = await _vector_store.search(
+            query_embedding=query_embedding,
+            top_k=top_k,
+            source_filter="paper",
         )
 
         if not results:
@@ -341,8 +366,13 @@ def search_papers_by_meaning(
         }, indent=2, default=str)
 
     except Exception as e:
-        logger.error(f"search_papers_by_meaning failed | error={e}")
-        return json.dumps({"error": str(e), "results": []})
+        logger.error(
+            f"search_papers_by_meaning failed | error={e}"
+        )
+        return json.dumps({
+            "error": str(e),
+            "results": [],
+        })
 
 
 # Tools exported for agents to use.

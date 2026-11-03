@@ -1,0 +1,193 @@
+[1mdiff --git a/processing/vector_store.py b/processing/vector_store.py[m
+[1mindex ec3ca8f..8377023 100644[m
+[1m--- a/processing/vector_store.py[m
+[1m+++ b/processing/vector_store.py[m
+[36m@@ -1,3 +1,4 @@[m
+[32m+[m[32mfrom datetime import datetime, timezone[m
+ import asyncio[m
+ import json[m
+ from typing import Any[m
+[36m@@ -6,6 +7,7 @@[m [mimport asyncpg[m
+ [m
+ from config.logging_config import setup_logging[m
+ from config.settings import settings[m
+[32m+[m[32mfrom processing.chunker import TextChunk[m
+ from processing.embedder import EmbeddedChunk[m
+ [m
+ [m
+[36m@@ -17,10 +19,11 @@[m [mTOP_K_DEFAULT = 5[m
+ [m
+ [m
+ class VectorStore:[m
+[31m-    """Store embedded chunks in Cloud SQL and perform semantic search."""[m
+[32m+[m[32m    """Store embedded study and paper chunks in Cloud SQL."""[m
+ [m
+     def __init__(self):[m
+         self._pool: asyncpg.Pool | None = None[m
+[32m+[m[32m        self._init_lock = asyncio.Lock()[m
+ [m
+     async def __aenter__(self) -> "VectorStore":[m
+         await self.init()[m
+[36m@@ -29,35 +32,55 @@[m [mclass VectorStore:[m
+     async def __aexit__(self, exc_type, exc_val, exc_tb):[m
+         await self.close()[m
+ [m
+[32m+[m[32m    # --------------------------------------------------[m
+[32m+[m[32m    # CONNECTION MANAGEMENT[m
+[32m+[m[32m    # --------------------------------------------------[m
+[32m+[m
+     async def init(self) -> None:[m
+[31m-        """Create the connection pool and register the pgvector codec."""[m
+[32m+[m[32m        """Create the connection pool safely."""[m
+ [m
+[31m-        logger.info([m
+[31m-            f"Connecting to Cloud SQL | "[m
+[31m-            f"host={settings.db_host} | "[m
+[31m-            f"database={settings.db_name}"[m
+[31m-        )[m
+[32m+[m[32m        if self._pool is not None:[m
+[32m+[m[32m            return[m
+ [m
+[31m-        self._pool = await asyncpg.create_pool([m
+[31m-            host=settings.db_host,[m
+[31m-            port=int(settings.db_port),[m
+[31m-            database=settings.db_name,[m
+[31m-            user=settings.db_user,[m
+[31m-            password=settings.db_password,[m
+[31m-            min_size=POOL_MIN_SIZE,[m
+[31m-            max_size=POOL_MAX_SIZE,[m
+[31m-            init=self._init_connection,[m
+[31m-        )[m
+[32m+[m[32m        async with self._init_lock:[m
+[32m+[m[32m            if self._pool is not None:[m
+[32m+[m[32m                return[m
+[32m+[m
+[32m+[m[32m            logger.info([m
+[32m+[m[32m                f"Connecting to Cloud SQL | "[m
+[32m+[m[32m                f"host={settings.db_host} | "[m
+[32m+[m[32m                f"database={settings.db_name}"[m
+[32m+[m[32m            )[m
+ [m
+[31m-        logger.info("Connection pool created successfully")[m
+[32m+[m[32m            self._pool = await asyncpg.create_pool([m
+[32m+[m[32m                host=settings.db_host,[m
+[32m+[m[32m                port=int(settings.db_port),[m
+[32m+[m[32m                database=settings.db_name,[m
+[32m+[m[32m                user=settings.db_user,[m
+[32m+[m[32m                password=settings.db_password,[m
+[32m+[m[32m                min_size=POOL_MIN_SIZE,[m
+[32m+[m[32m                max_size=POOL_MAX_SIZE,[m
+[32m+[m[32m                init=self._init_connection,[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            logger.info("Connection pool created successfully")[m
+[32m+[m
+[32m+[m[32m    async def _ensure_pool(self) -> None:[m
+[32m+[m[32m        """Initialize the pool if it does not exist."""[m
+ [m
+[31m-    async def _init_connection(self, conn: asyncpg.Connection) -> None:[m
+[31m-        """Register the pgvector codec for Python/PostgreSQL conversion."""[m
+[32m+[m[32m        if self._pool is None:[m
+[32m+[m[32m            await self.init()[m
+[32m+[m
+[32m+[m[32m    async def _init_connection([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        conn: asyncpg.Connection,[m
+[32m+[m[32m    ) -> None:[m
+[32m+[m[32m        """Register the pgvector codec."""[m
+ [m
+         await conn.set_type_codec([m
+             "vector",[m
+[31m-            encoder=lambda v: json.dumps(v),[m
+[31m-            decoder=lambda v: json.loads(v),[m
+[32m+[m[32m            encoder=lambda value: json.dumps(value),[m
+[32m+[m[32m            decoder=lambda value: json.loads(value),[m
+             schema="public",[m
+             format="text",[m
+         )[m
+[36m@@ -65,105 +88,566 @@[m [mclass VectorStore:[m
+     async def close(self) -> None:[m
+         """Close the connection pool."""[m
+ [m
+[31m-        if self._pool:[m
+[32m+[m[32m        if self._pool is not None:[m
+             await self._pool.close()[m
+             self._pool = None[m
+[32m+[m
+             logger.info("Connection pool closed")[m
+ [m
+[32m+[m[32m    # --------------------------------------------------[m
+[32m+[m[32m    # INCREMENTAL EMBEDDING[m
+[32m+[m[32m    # --------------------------------------------------[m
+[32m+[m
+[32m+[m[32m    async def get_chunks_needing_embedding([m
+[32m+[m[32m        self,[m
+[32m+[m[32m        chunks: list[TextChunk],[m
+[32m+[m[32m    ) -> list[TextChunk]:[m
+[32m+[m[32m        """[m
+[32m+[m[32m        Return only new or modified chunks.[m
+[32m+[m
+[32m+[m[32m        Existing chunks with identical text are skipped.[m
+[32m+[m[32m        This method performs read-only database queries.[m
+[32m+[m[32m        """[m
+[32m+[m
+[32m+[m[32m        if not chunks:[m
+[32m+[m[32m            return [][m
+[32m+[m
+[32m+[m[32m        await self._ensure_pool()[m
+[32m+[m
+[32m+[m[32m        study_ids = list({[m
+[32m+[m[32m            chunk.nct_id[m
+[32m+[m[32m            for chunk in chunks[m
+[32m+[m[32m            if chunk.source == "study" and chunk.nct_id[m
+[32m+[m[32m        })[m
+[32m+[m
+[32m+[m[32m        paper_ids = list({[m
+[32m+[m[32m            chunk.pmid[m
+[32m+[m[32m            for chunk in chunks[m
+[32m+[m[32m            if chunk.source == "paper" and chunk.pmid[m
+[32m+[m[32m        })[m
+[32m+[m
+[32m+[m[32m        existing = {}[m
+[32m+[m
+[32m+[m[32m        async with self._pool.acquire() as conn:[m
+[32m+[m
+[32m+[m[32m            if study_ids:[m
+[32m+[m[32m                rows = await conn.fetch([m
+[32m+[m[32m                    """[m
+[32m+[m[32m                    SELECT nct_id, chunk_index, chunk_text[m
+[32m+[m[32m                    FROM chunks[m
+[32m+[m[32m                    WHERE source = 'study'[m
+[32m+[m[32m                      AND nct_id = ANY($1::text[])[m
+[32m+[m[32m                    """,[m
+[32m+[m[32m                    study_ids,[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m                for row in rows:[m
+[32m+[m[32m                    key = ([m
+[32m+[m[32m                        "study",[m
+[32m+[m[32m                        row["nct_id"],[m
+[32m+[m[32m                        row["chunk_index"],[m
+[32m+[m[32m                    )[m
+[32m+[m
+[32m+[m[32m                    existing[key] = row["chunk_text"][m
+[32m+[m
+[32m+[m[32m            if paper_ids:[m
+[32m+[m[32m                rows = await conn.fetch([m
+[32m+[m[32m                    """[m
+[32m+[m[32m                    SELECT pmid, chunk_index, chunk_text[m
+[32m+[m[32m                    FROM chunks[m
+[32m+[m[32m                    WHERE source = 'paper'[m
+[32m+[m[32m                      AND pmid = ANY($1::text[])[m
+[32m+[m[32m                    """,[m
+[32m+[m[32m                    paper_ids,[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m                for row in rows:[m
+[32m+[m[32m                    key = ([m
+[32m+[m[32m                        "paper",[m
+[32m+[m[32m                        row["pmid"],[m
+[32m+[m[32m                        row["chunk_index"],[m
+[32m+[m[32m                    )[m
+[32m+[m
+[32m+[m[32m                    existing[key] = row["chunk_

@@ -1,3 +1,4 @@
+
 import asyncio
 from dataclasses import dataclass
 
@@ -17,10 +18,11 @@ RETRY_SLEEP_SECONDS = 2
 
 @dataclass
 class EmbeddedChunk:
-    """A text chunk with its vector embedding."""
+    """A text chunk with its vector embedding and document metadata."""
 
     chunk_id: str
-    nct_id: str
+    nct_id: str | None
+    pmid: str | None
     chunk_text: str
     chunk_index: int
     source: str
@@ -32,10 +34,34 @@ class Embedder:
     """Generate vector embeddings for text chunks using OpenAI."""
 
     def __init__(self):
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self._client = AsyncOpenAI(
+            api_key=settings.openai_api_key
+        )
         self._model = settings.openai_embedding_model
 
-        logger.info(f"Embedder initialised | model={self._model}")
+        logger.info(
+            f"Embedder initialised | model={self._model}"
+        )
+
+    async def embed_query(self, query: str) -> list[float]:
+        """Generate an embedding for a single search query."""
+
+        if not query or not query.strip():
+            raise ValueError("Embedding query cannot be empty.")
+
+        response = await self._client.embeddings.create(
+            model=self._model,
+            input=query.strip(),
+        )
+
+        embedding = response.data[0].embedding
+
+        logger.info(
+            f"Query embedded successfully | "
+            f"dimensions={len(embedding)}"
+        )
+
+        return embedding
 
     async def embed_chunks(
         self,
@@ -44,7 +70,9 @@ class Embedder:
         """Embed chunks in batches, skipping batches that fail after retries."""
 
         if not chunks:
-            logger.warning("embed_chunks called with empty list")
+            logger.warning(
+                "embed_chunks called with empty list"
+            )
             return []
 
         logger.info(
@@ -67,6 +95,7 @@ class Embedder:
                 batch=batch,
                 batch_num=batch_num,
             )
+
             all_embedded.extend(embedded_batch)
 
             if batch_num < len(batches) - 1:
@@ -112,14 +141,18 @@ class Embedder:
                         f"error={e} | "
                         f"retrying in {RETRY_SLEEP_SECONDS}s..."
                     )
+
                     await asyncio.sleep(RETRY_SLEEP_SECONDS)
+
                 else:
                     logger.error(
-                        f"Embedding failed after {RETRY_ATTEMPTS} attempts | "
+                        f"Embedding failed after "
+                        f"{RETRY_ATTEMPTS} attempts | "
                         f"batch={batch_num + 1} | "
                         f"error={e} | "
                         f"skipping this batch"
                     )
+
                     return []
 
         return []
@@ -130,7 +163,10 @@ class Embedder:
     ) -> list[EmbeddedChunk]:
         """Generate embeddings for one batch of chunks."""
 
-        texts = [chunk.chunk_text for chunk in batch]
+        texts = [
+            chunk.chunk_text
+            for chunk in batch
+        ]
 
         response = await self._client.embeddings.create(
             model=self._model,
@@ -144,6 +180,7 @@ class Embedder:
                 EmbeddedChunk(
                     chunk_id=chunk.chunk_id,
                     nct_id=chunk.nct_id,
+                    pmid=chunk.pmid,
                     chunk_text=chunk.chunk_text,
                     chunk_index=chunk.chunk_index,
                     source=chunk.source,

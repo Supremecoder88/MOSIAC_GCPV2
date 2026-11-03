@@ -13,10 +13,11 @@ OVERLAP_SIZE = 50
 
 @dataclass
 class TextChunk:
-    """A text chunk with its source and metadata."""
+    """A text chunk with its source and document metadata."""
 
     chunk_id: str
-    nct_id: str
+    nct_id: str | None
+    pmid: str | None
     chunk_text: str
     chunk_index: int
     source: str
@@ -30,9 +31,11 @@ class Chunker:
         """Chunk a parsed clinical study."""
 
         full_text = self._build_study_text(study)
+
         chunks = self._split_into_chunks(
             text=full_text,
             nct_id=study.nct_id,
+            pmid=None,
             source="study",
         )
 
@@ -40,15 +43,18 @@ class Chunker:
             f"Chunked study | nct_id={study.nct_id} | "
             f"chunks_produced={len(chunks)}"
         )
+
         return chunks
 
     def chunk_paper(self, paper: ParsedPaper) -> list[TextChunk]:
         """Chunk a parsed research paper."""
 
         full_text = self._build_paper_text(paper)
+
         chunks = self._split_into_chunks(
             text=full_text,
-            nct_id=paper.pmid,
+            nct_id=None,
+            pmid=paper.pmid,
             source="paper",
         )
 
@@ -56,9 +62,13 @@ class Chunker:
             f"Chunked paper | pmid={paper.pmid} | "
             f"chunks_produced={len(chunks)}"
         )
+
         return chunks
 
-    def chunk_studies(self, studies: list[ParsedStudy]) -> list[TextChunk]:
+    def chunk_studies(
+        self,
+        studies: list[ParsedStudy],
+    ) -> list[TextChunk]:
         """Chunk multiple studies into one list."""
 
         all_chunks = []
@@ -70,9 +80,13 @@ class Chunker:
             f"Chunked all studies | studies={len(studies)} | "
             f"total_chunks={len(all_chunks)}"
         )
+
         return all_chunks
 
-    def chunk_papers(self, papers: list[ParsedPaper]) -> list[TextChunk]:
+    def chunk_papers(
+        self,
+        papers: list[ParsedPaper],
+    ) -> list[TextChunk]:
         """Chunk multiple papers into one list."""
 
         all_chunks = []
@@ -84,6 +98,7 @@ class Chunker:
             f"Chunked all papers | papers={len(papers)} | "
             f"total_chunks={len(all_chunks)}"
         )
+
         return all_chunks
 
     def _build_study_text(self, study: ParsedStudy) -> str:
@@ -98,7 +113,9 @@ class Chunker:
         ]
 
         if study.conditions:
-            sections.append(f"CONDITIONS: {', '.join(study.conditions)}")
+            sections.append(
+                f"CONDITIONS: {', '.join(study.conditions)}"
+            )
 
         if study.interventions:
             sections.append(
@@ -106,25 +123,33 @@ class Chunker:
             )
 
         if study.primary_outcome:
-            sections.append(f"PRIMARY OUTCOME: {study.primary_outcome}")
+            sections.append(
+                f"PRIMARY OUTCOME: {study.primary_outcome}"
+            )
 
         if study.secondary_outcomes:
             sections.append(
-                f"SECONDARY OUTCOMES: {'; '.join(study.secondary_outcomes)}"
+                f"SECONDARY OUTCOMES: "
+                f"{'; '.join(study.secondary_outcomes)}"
             )
 
         if study.start_date:
             sections.append(f"START DATE: {study.start_date}")
 
         if study.completion_date:
-            sections.append(f"COMPLETION DATE: {study.completion_date}")
+            sections.append(
+                f"COMPLETION DATE: {study.completion_date}"
+            )
 
         sections.append(
-            f"RESULTS POSTED: {'YES' if study.results_posted else 'NO'}"
+            f"RESULTS POSTED: "
+            f"{'YES' if study.results_posted else 'NO'}"
         )
 
         if study.enrollment:
-            sections.append(f"ENROLLMENT: {study.enrollment} participants")
+            sections.append(
+                f"ENROLLMENT: {study.enrollment} participants"
+            )
 
         if study.protocol_amendments:
             sections.append(
@@ -146,10 +171,14 @@ class Chunker:
             sections.append(f"JOURNAL: {paper.journal}")
 
         if paper.pub_date:
-            sections.append(f"PUBLICATION DATE: {paper.pub_date}")
+            sections.append(
+                f"PUBLICATION DATE: {paper.pub_date}"
+            )
 
         if paper.authors:
-            sections.append(f"AUTHORS: {', '.join(paper.authors[:5])}")
+            sections.append(
+                f"AUTHORS: {', '.join(paper.authors[:5])}"
+            )
 
         if paper.nct_ids_referenced:
             sections.append(
@@ -165,21 +194,25 @@ class Chunker:
     def _split_into_chunks(
         self,
         text: str,
-        nct_id: str,
+        nct_id: str | None,
+        pmid: str | None,
         source: str,
     ) -> list[TextChunk]:
         """Split text into overlapping chunks."""
 
         words = text.split()
 
+        document_id = nct_id or pmid or "unknown"
+
         if not words:
             logger.warning(
                 f"Empty text — no chunks produced | "
-                f"nct_id={nct_id} | source={source}"
+                f"document_id={document_id} | source={source}"
             )
             return []
 
         chunks: list[TextChunk] = []
+
         step = CHUNK_SIZE - OVERLAP_SIZE
         chunk_index = 0
 
@@ -191,19 +224,24 @@ class Chunker:
 
             chunks.append(
                 TextChunk(
-                    chunk_id=f"{nct_id}_chunk_{chunk_index}",
+                    chunk_id=(
+                        f"{source}:{document_id}:chunk_{chunk_index}"
+                    ),
                     nct_id=nct_id,
+                    pmid=pmid,
                     chunk_text=" ".join(chunk_words),
                     chunk_index=chunk_index,
                     source=source,
                     word_count=len(chunk_words),
                 )
             )
+
             chunk_index += 1
 
         logger.info(
-            f"Split complete | nct_id={nct_id} | "
-            f"total_words={len(words)} | chunks={len(chunks)} | "
+            f"Split complete | document_id={document_id} | "
+            f"source={source} | total_words={len(words)} | "
+            f"chunks={len(chunks)} | "
             f"chunk_size={CHUNK_SIZE} | overlap={OVERLAP_SIZE}"
         )
 

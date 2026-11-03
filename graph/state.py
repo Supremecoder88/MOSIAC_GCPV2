@@ -7,11 +7,18 @@ from langchain_core.messages import BaseMessage
 def _merge_lists(a: list, b: list) -> list:
     """
     Reducer that APPENDS lists instead of replacing them.
-    When multiple agents write to the same list field simultaneously,
-    LangGraph uses this function to merge their outputs together.
-    Without this, parallel agents overwrite each other's results.
+    Used for signals and error logs so parallel agent outputs
+    are preserved.
     """
     return (a or []) + (b or [])
+
+
+def _merge_unique(a: list, b: list) -> list:
+    """
+    Merge agent names while preserving insertion order.
+    Prevents duplicate agent entries during parallel execution.
+    """
+    return list(dict.fromkeys((a or []) + (b or [])))
 
 
 class SignalOutput(TypedDict):
@@ -33,13 +40,9 @@ class MosaicState(TypedDict):
     # ── CONVERSATION HISTORY ───────────────────────────────────
     messages: Annotated[list[BaseMessage], add_messages]
 
-    # ── AGENT OUTPUTS — Annotated with _merge_lists ────────────
-    # These fields are written by multiple agents IN PARALLEL.
-    # Without Annotated + reducer, LangGraph crashes with:
-    # "Can receive only one value per step"
-    # _merge_lists tells LangGraph: APPEND results, don't replace.
+    # ── AGENT OUTPUTS ──────────────────────────────────────────
     signals:          Annotated[list[SignalOutput], _merge_lists]
-    agents_activated: Annotated[list[str], _merge_lists]
+    agents_activated: Annotated[list[str], _merge_unique]
     error_log:        Annotated[list, _merge_lists]
 
     # ── SUPERVISOR OUTPUTS ─────────────────────────────────────
