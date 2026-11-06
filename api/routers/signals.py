@@ -1,8 +1,6 @@
-import asyncpg
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from config.settings import settings
 from config.logging_config import setup_logging
 
 
@@ -10,17 +8,18 @@ logger = setup_logging(__name__)
 router = APIRouter()
 
 
-async def _get_pool():
-    """Create a database connection pool."""
-    return await asyncpg.create_pool(
-        host=settings.db_host,
-        port=settings.db_port,
-        database=settings.db_name,
-        user=settings.db_user,
-        password=settings.db_password,
-        min_size=1,
-        max_size=5,
-    )
+def _get_pool(request: Request):
+    """Get the shared application database pool."""
+
+    pool = getattr(request.app.state, "db_pool", None)
+
+    if pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection pool is unavailable.",
+        )
+
+    return pool
 
 
 @router.get(
@@ -30,6 +29,7 @@ async def _get_pool():
     tags=["Signals"],
 )
 async def list_signals(
+    request: Request,
     agent: str = Query(
         default=None,
         description="Filter by agent name",
@@ -51,7 +51,7 @@ async def list_signals(
 ):
     """Return signals with optional filters."""
 
-    pool = await _get_pool()
+    pool = _get_pool(request)
 
     try:
         async with pool.acquire() as conn:
@@ -96,8 +96,14 @@ async def list_signals(
 
         return [dict(row) for row in rows]
 
-    finally:
-        await pool.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to retrieve signals | error={e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve signals.",
+        )
 
 
 @router.get(
@@ -105,10 +111,13 @@ async def list_signals(
     summary="Get one signal by ID",
     tags=["Signals"],
 )
-async def get_signal(signal_id: str):
+async def get_signal(
+    signal_id: str,
+    request: Request,
+):
     """Return details for a specific signal."""
 
-    pool = await _get_pool()
+    pool = _get_pool(request)
 
     try:
         async with pool.acquire() as conn:
@@ -131,5 +140,13 @@ async def get_signal(signal_id: str):
 
         return dict(row)
 
-    finally:
-        await pool.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Failed to retrieve signal | signal_id={signal_id} | error={e}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve signal.",
+        )

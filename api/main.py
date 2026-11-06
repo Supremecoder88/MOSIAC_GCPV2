@@ -1,8 +1,9 @@
+
 import asyncpg
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.dependencies import get_hitl_gate, get_procedural_store
@@ -20,20 +21,42 @@ async def lifespan(app: FastAPI):
 
     logger.info("MOSAIC API starting up...")
 
+    app.state.db_pool = None
+
+    try:
+        app.state.db_pool = await asyncpg.create_pool(
+            host=settings.db_host,
+            port=settings.db_port,
+            database=settings.db_name,
+            user=settings.db_user,
+            password=settings.db_password,
+            min_size=1,
+            max_size=3,
+            command_timeout=30,
+        )
+        logger.info("Shared database connection pool initialized")
+    except Exception as e:
+        logger.error(f"Database pool initialization failed | error={e}")
+
     try:
         procedural_store = get_procedural_store()
         await procedural_store.initialise_defaults()
         logger.info("Default agent procedures initialised")
     except Exception as e:
-        logger.error(
-            f"Failed to initialise procedures | error={e}"
-        )
+        logger.error(f"Failed to initialise procedures | error={e}")
 
     logger.info("MOSAIC API ready | version=0.1.0")
 
     yield
 
     logger.info("MOSAIC API shutting down...")
+
+    if app.state.db_pool is not None:
+        try:
+            await app.state.db_pool.close()
+            logger.info("Shared database pool closed")
+        except Exception as e:
+            logger.error(f"Error closing database pool | error={e}")
 
     try:
         hitl = get_hitl_gate()
@@ -70,25 +93,10 @@ app.add_middleware(
 )
 
 
-app.include_router(
-    analysis.router,
-    prefix="/api/v1",
-)
-
-app.include_router(
-    signals.router,
-    prefix="/api/v1",
-)
-
-app.include_router(
-    review.router,
-    prefix="/api/v1",
-)
-
-app.include_router(
-    memory.router,
-    prefix="/api/v1",
-)
+app.include_router(analysis.router, prefix="/api/v1")
+app.include_router(signals.router, prefix="/api/v1")
+app.include_router(review.router, prefix="/api/v1")
+app.include_router(memory.router, prefix="/api/v1")
 
 
 @app.get(
@@ -103,68 +111,54 @@ app.include_router(
 async def health_check():
     """Return system and database health status."""
 
-    db_status = "connected"
-    signals_count = 0
-    pending_count = 0
-    episodes_count = 0
+    pool = app.state.db_pool
 
-    try:
-        pool = await asyncpg.create_pool(
-            host=settings.db_host,
-            port=settings.db_port,
-            database=settings.db_name,
-            user=settings.db_user,
-            password=settings.db_password,
-            min_size=1,
-            max_size=2,
+    if pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection pool is unavailable.",
         )
 
+    try:
         async with pool.acquire() as conn:
             signals_count = (
                 await conn.fetchval(
                     "SELECT COUNT(*) FROM signals"
-                )
-                or 0
+                ) or 0
             )
 
             pending_count = (
                 await conn.fetchval(
-                    "SELECT COUNT(*) "
-                    "FROM hitl_reviews "
+                    "SELECT COUNT(*) FROM hitl_reviews "
                     "WHERE decision = 'pending'"
-                )
-                or 0
+                ) or 0
             )
 
             episodes_count = (
                 await conn.fetchval(
                     "SELECT COUNT(*) FROM episodes"
-                )
-                or 0
+                ) or 0
             )
 
-        await pool.close()
+        return {
+            "status": "healthy",
+            "app": "MOSAIC",
+            "version": "0.1.0",
+            "database": "connected",
+            "details": {
+                "signals_in_db": signals_count,
+                "pending_reviews": pending_count,
+                "episodes_count": episodes_count,
+                "queue_depth": pending_count,
+            },
+        }
 
     except Exception as e:
-        db_status = f"disconnected: {str(e)}"
         logger.error(f"Health check DB error | error={e}")
-
-    return {
-        "status": (
-            "healthy"
-            if db_status == "connected"
-            else "degraded"
-        ),
-        "app": "MOSAIC",
-        "version": "0.1.0",
-        "database": db_status,
-        "details": {
-            "signals_in_db": signals_count,
-            "pending_reviews": pending_count,
-            "episodes_count": episodes_count,
-            "queue_depth": pending_count,
-        },
-    }
+        raise HTTPException(
+            status_code=503,
+            detail="Database health check failed.",
+        )
 
 
 @app.get("/", tags=["System"])

@@ -24,7 +24,7 @@ def _merge_unique(a: list, b: list) -> list:
 class SignalOutput(TypedDict):
     agent:       str
     signal_type: str
-    nct_id:      str
+    nct_id:      str | None
     summary:     str
     evidence:    list
     confidence:  float

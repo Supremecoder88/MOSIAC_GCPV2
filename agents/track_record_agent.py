@@ -106,7 +106,7 @@ OUTPUT FORMAT:
 Return valid JSON objects for detected signals:
 
 {{
-    "nct_id": "N/A or study ID",
+    "nct_id": "A valid NCT ID associated with the evidence, or null if unavailable",
     "signal_type": "low_credibility",
     "summary": "Sponsor name, credibility score, and pattern",
     "evidence": ["fact 1", "fact 2"],
@@ -358,7 +358,7 @@ def _parse_signals(
             signal: SignalOutput = {
                 "agent": agent_name,
                 "signal_type": SIGNAL_TYPE,
-                "nct_id": data.get("nct_id", "N/A"),
+                "nct_id": data.get("nct_id") or None,
                 "summary": data.get("summary", ""),
                 "evidence": data.get("evidence", []),
                 "confidence": confidence,
