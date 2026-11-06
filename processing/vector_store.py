@@ -7,6 +7,7 @@ import asyncpg
 
 from config.logging_config import setup_logging
 from config.settings import settings
+from config.shared_pool import get_shared_pool
 from processing.chunker import TextChunk
 from processing.embedder import EmbeddedChunk
 
@@ -23,6 +24,7 @@ class VectorStore:
 
     def __init__(self):
         self._pool: asyncpg.Pool | None = None
+        self._owns_pool = False
         self._init_lock = asyncio.Lock()
 
     async def __aenter__(self) -> "VectorStore":
@@ -37,13 +39,21 @@ class VectorStore:
     # --------------------------------------------------
 
     async def init(self) -> None:
-        """Create the connection pool safely."""
+        """Create or reuse the connection pool safely."""
 
         if self._pool is not None:
             return
 
         async with self._init_lock:
             if self._pool is not None:
+                return
+
+            shared_pool = get_shared_pool()
+
+            if shared_pool is not None:
+                self._pool = shared_pool
+                self._owns_pool = False
+                logger.info("VectorStore using shared database pool")
                 return
 
             logger.info(
@@ -63,7 +73,8 @@ class VectorStore:
                 init=self._init_connection,
             )
 
-            logger.info("Connection pool created successfully")
+            self._owns_pool = True
+            logger.info("Standalone connection pool created successfully")
 
     async def _ensure_pool(self) -> None:
         """Initialize the pool if it does not exist."""
@@ -86,13 +97,14 @@ class VectorStore:
         )
 
     async def close(self) -> None:
-        """Close the connection pool."""
+        """Close only a standalone pool owned by this VectorStore."""
 
-        if self._pool is not None:
+        if self._pool is not None and self._owns_pool:
             await self._pool.close()
-            self._pool = None
+            logger.info("Standalone connection pool closed")
 
-            logger.info("Connection pool closed")
+        self._pool = None
+        self._owns_pool = False
 
     # --------------------------------------------------
     # INCREMENTAL EMBEDDING
@@ -462,7 +474,6 @@ class VectorStore:
     # STUDY METADATA
     # --------------------------------------------------
 
-    
     async def save_study(
         self,
         study_data: dict[str, Any],

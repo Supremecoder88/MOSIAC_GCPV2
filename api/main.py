@@ -10,6 +10,10 @@ from api.dependencies import get_hitl_gate, get_procedural_store
 from api.routers import analysis, signals, review, memory
 from config.logging_config import setup_logging
 from config.settings import settings
+from config.shared_pool import (
+    register_pgvector_codec,
+    set_shared_pool,
+)
 
 
 logger = setup_logging(__name__)
@@ -22,28 +26,46 @@ async def lifespan(app: FastAPI):
     logger.info("MOSAIC API starting up...")
 
     app.state.db_pool = None
+    set_shared_pool(None)
 
     try:
         app.state.db_pool = await asyncpg.create_pool(
             host=settings.db_host,
-            port=settings.db_port,
+            port=int(settings.db_port),
             database=settings.db_name,
             user=settings.db_user,
             password=settings.db_password,
             min_size=1,
             max_size=3,
             command_timeout=30,
+            init=register_pgvector_codec,
         )
-        logger.info("Shared database connection pool initialized")
-    except Exception as e:
-        logger.error(f"Database pool initialization failed | error={e}")
 
-    try:
-        procedural_store = get_procedural_store()
-        await procedural_store.initialise_defaults()
-        logger.info("Default agent procedures initialised")
+        set_shared_pool(app.state.db_pool)
+
+        logger.info("Shared database connection pool initialized")
+
     except Exception as e:
-        logger.error(f"Failed to initialise procedures | error={e}")
+        logger.error(
+            f"Database pool initialization failed | error={e}"
+        )
+
+    if app.state.db_pool is not None:
+        try:
+            procedural_store = get_procedural_store()
+            await procedural_store.initialise_defaults()
+
+            logger.info("Default agent procedures initialised")
+
+        except Exception as e:
+            logger.error(
+                f"Failed to initialise procedures | error={e}"
+            )
+    else:
+        logger.warning(
+            "Skipping default procedure initialization because "
+            "the shared database pool is unavailable."
+        )
 
     logger.info("MOSAIC API ready | version=0.1.0")
 
@@ -51,19 +73,37 @@ async def lifespan(app: FastAPI):
 
     logger.info("MOSAIC API shutting down...")
 
-    if app.state.db_pool is not None:
-        try:
-            await app.state.db_pool.close()
-            logger.info("Shared database pool closed")
-        except Exception as e:
-            logger.error(f"Error closing database pool | error={e}")
+    try:
+        procedural_store = get_procedural_store()
+        await procedural_store.close()
+        logger.info("ProceduralStore closed")
+
+    except Exception as e:
+        logger.error(
+            f"Error closing ProceduralStore | error={e}"
+        )
 
     try:
         hitl = get_hitl_gate()
         await hitl.close()
-        logger.info("HITLGate pool closed")
+        logger.info("HITLGate closed")
+
     except Exception as e:
-        logger.error(f"Error closing HITLGate | error={e}")
+        logger.error(
+            f"Error closing HITLGate | error={e}"
+        )
+
+    if app.state.db_pool is not None:
+        try:
+            await app.state.db_pool.close()
+            logger.info("Shared database pool closed")
+
+        except Exception as e:
+            logger.error(
+                f"Error closing database pool | error={e}"
+            )
+
+    set_shared_pool(None)
 
     logger.info("MOSAIC API shutdown complete")
 
@@ -154,7 +194,10 @@ async def health_check():
         }
 
     except Exception as e:
-        logger.error(f"Health check DB error | error={e}")
+        logger.error(
+            f"Health check DB error | error={e}"
+        )
+
         raise HTTPException(
             status_code=503,
             detail="Database health check failed.",

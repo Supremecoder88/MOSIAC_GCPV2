@@ -1,4 +1,3 @@
-
 import uuid
 import json
 from datetime import datetime
@@ -9,6 +8,7 @@ import asyncpg
 from memory.procedural_store import ProceduralStore
 from config.settings import settings
 from config.logging_config import setup_logging
+from config.shared_pool import get_shared_pool
 
 logger = setup_logging(__name__)
 
@@ -31,21 +31,34 @@ class HITLGate:
 
     def __init__(self):
         self._pool: asyncpg.Pool | None = None
+        self._owns_pool = False
         self._procedural_store = ProceduralStore()
 
     async def _ensure_pool(self) -> None:
+        """Use the shared pool or create a standalone pool when needed."""
         if self._pool is not None:
+            return
+
+        shared_pool = get_shared_pool()
+
+        if shared_pool is not None:
+            self._pool = shared_pool
+            self._owns_pool = False
+            logger.info("HITLGate using shared database pool")
             return
 
         self._pool = await asyncpg.create_pool(
             host=settings.db_host,
-            port=settings.db_port,
+            port=int(settings.db_port),
             database=settings.db_name,
             user=settings.db_user,
             password=settings.db_password,
             min_size=1,
             max_size=5,
         )
+
+        self._owns_pool = True
+        logger.info("HITLGate standalone pool created")
 
     async def _resolve_nct_id(
         self,
@@ -373,6 +386,10 @@ class HITLGate:
         return [dict(row) for row in rows]
 
     async def close(self) -> None:
-        if self._pool:
+        """Close only the database pool owned by this instance."""
+        if self._pool is not None and self._owns_pool:
             await self._pool.close()
-            self._pool = None
+            logger.info("HITLGate standalone pool closed")
+
+        self._pool = None
+        self._owns_pool = False

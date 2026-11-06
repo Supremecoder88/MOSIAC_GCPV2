@@ -1,6 +1,9 @@
 import asyncpg
+
 from config.settings import settings
 from config.logging_config import setup_logging
+from config.shared_pool import get_shared_pool
+
 
 logger = setup_logging(__name__)
 
@@ -107,11 +110,20 @@ class ProceduralStore:
 
     def __init__(self):
         self._pool: asyncpg.Pool | None = None
+        self._owns_pool = False
         logger.info("ProceduralStore initialised")
 
     async def _ensure_pool(self) -> None:
-        """Create the database connection pool when needed."""
+        """Use the shared pool or create a standalone pool when needed."""
         if self._pool is not None:
+            return
+
+        shared_pool = get_shared_pool()
+
+        if shared_pool is not None:
+            self._pool = shared_pool
+            self._owns_pool = False
+            logger.info("ProceduralStore using shared database pool")
             return
 
         self._pool = await asyncpg.create_pool(
@@ -124,7 +136,8 @@ class ProceduralStore:
             max_size=3,
         )
 
-        logger.info("ProceduralStore pool created")
+        self._owns_pool = True
+        logger.info("ProceduralStore standalone pool created")
 
     async def initialise_defaults(self) -> None:
         """Insert default rules without duplicating existing rows."""
@@ -251,8 +264,10 @@ class ProceduralStore:
         ]
 
     async def close(self) -> None:
-        """Close the database connection pool."""
-        if self._pool:
+        """Close only the database pool owned by this store."""
+        if self._pool is not None and self._owns_pool:
             await self._pool.close()
-            self._pool = None
-            logger.info("ProceduralStore pool closed")
+            logger.info("ProceduralStore standalone pool closed")
+
+        self._pool = None
+        self._owns_pool = False

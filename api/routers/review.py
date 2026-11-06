@@ -8,6 +8,7 @@ from api.schemas import (
 from api.dependencies import get_hitl_gate
 from graph.hitl import HITLGate
 from config.logging_config import setup_logging
+from config.shared_pool import get_shared_pool
 
 
 logger = setup_logging(__name__)
@@ -31,19 +32,22 @@ async def get_review_queue(
 
     try:
         queue_items = await hitl_gate.get_review_queue()
+        queue_items = [
+            {
+                **item,
+                "review_id": str(item["review_id"]),
+                "signal_id": str(item["signal_id"]),
+            }
+            for item in queue_items
+        ]
 
-        import asyncpg
-        from config.settings import settings
+        pool = get_shared_pool()
 
-        pool = await asyncpg.create_pool(
-            host=settings.db_host,
-            port=settings.db_port,
-            database=settings.db_name,
-            user=settings.db_user,
-            password=settings.db_password,
-            min_size=1,
-            max_size=2,
-        )
+        if pool is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection pool is unavailable.",
+            )
 
         async with pool.acquire() as conn:
             pending = await conn.fetchval(
@@ -56,8 +60,6 @@ async def get_review_queue(
                 "SELECT COUNT(*) FROM hitl_reviews WHERE decision = 'reject'"
             )
 
-        await pool.close()
-
         return ReviewQueueResponse(
             queue=queue_items,
             total_pending=pending or 0,
@@ -65,6 +67,8 @@ async def get_review_queue(
             total_rejected=rejected or 0,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"get_review_queue failed | error={e}")
         raise HTTPException(status_code=500, detail=str(e))

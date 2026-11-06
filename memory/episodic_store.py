@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 
 from config.settings import settings
 from config.logging_config import setup_logging
+from config.shared_pool import get_shared_pool
 
 
 logger = setup_logging(__name__)
@@ -17,14 +18,23 @@ class EpisodicStore:
 
     def __init__(self):
         self._pool: asyncpg.Pool | None = None
+        self._owns_pool = False
         self._openai = AsyncOpenAI(api_key=settings.openai_api_key)
         self._embedding_model = settings.openai_embedding_model
 
         logger.info("EpisodicStore initialised")
 
     async def _ensure_pool(self) -> None:
-        """Create the database connection pool when needed."""
+        """Use the shared pool or create a standalone pool when needed."""
         if self._pool is not None:
+            return
+
+        shared_pool = get_shared_pool()
+
+        if shared_pool is not None:
+            self._pool = shared_pool
+            self._owns_pool = False
+            logger.info("EpisodicStore using shared database pool")
             return
 
         self._pool = await asyncpg.create_pool(
@@ -38,7 +48,8 @@ class EpisodicStore:
             init=self._init_connection,
         )
 
-        logger.info("EpisodicStore pool created")
+        self._owns_pool = True
+        logger.info("EpisodicStore standalone pool created")
 
     @staticmethod
     async def _init_connection(conn: asyncpg.Connection) -> None:
@@ -223,8 +234,10 @@ class EpisodicStore:
         return count or 0
 
     async def close(self) -> None:
-        """Close the database connection pool."""
-        if self._pool is not None:
+        """Close only the database pool owned by this store."""
+        if self._pool is not None and self._owns_pool:
             await self._pool.close()
-            self._pool = None
-            logger.info("EpisodicStore pool closed")
+            logger.info("EpisodicStore standalone pool closed")
+
+        self._pool = None
+        self._owns_pool = False
